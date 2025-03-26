@@ -1,7 +1,9 @@
 package rpc
 
 import (
+	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/package-url/packageurl-go"
 	"github.com/samber/lo"
@@ -829,8 +831,8 @@ func ConvertFromRPCPutBlobRequest(req *cache.PutBlobRequest) ftypes.BlobInfo {
 // ConvertToRPCOS returns common.OS
 func ConvertToRPCOS(fos ftypes.OS) *common.OS {
 	return &common.OS{
-		Family:   string(fos.Family),
-		Name:     fos.Name,
+		Family:   validateUTF8String(string(fos.Family), "OS.Family"),
+		Name:     validateUTF8String(fos.Name, "OS.Name"),
 		Eosl:     fos.Eosl,
 		Extended: fos.Extended,
 	}
@@ -842,8 +844,8 @@ func ConvertToRPCRepository(repo *ftypes.Repository) *common.Repository {
 		return nil
 	}
 	return &common.Repository{
-		Family:  string(repo.Family),
-		Release: repo.Release,
+		Family:  validateUTF8String(string(repo.Family), "Repository.Family"),
+		Release: validateUTF8String(repo.Release, "Repository.Release"),
 	}
 }
 
@@ -871,10 +873,13 @@ func ConvertToRPCArtifactInfo(imageID string, imageInfo ftypes.ArtifactInfo) *ca
 
 // ConvertToRPCPutBlobRequest returns PutBlobRequest
 func ConvertToRPCPutBlobRequest(diffID string, blobInfo ftypes.BlobInfo) *cache.PutBlobRequest {
+	// Validate and sanitize input diffID
+	sanitizedDiffID := validateUTF8String(diffID, "diffID")
+
 	var packageInfos []*common.PackageInfo
 	for _, pkgInfo := range blobInfo.PackageInfos {
 		packageInfos = append(packageInfos, &common.PackageInfo{
-			FilePath: pkgInfo.FilePath,
+			FilePath: validateUTF8String(pkgInfo.FilePath, "packageInfo.FilePath"),
 			Packages: ConvertToRPCPkgs(pkgInfo.Packages),
 		})
 	}
@@ -882,8 +887,8 @@ func ConvertToRPCPutBlobRequest(diffID string, blobInfo ftypes.BlobInfo) *cache.
 	var applications []*common.Application
 	for _, app := range blobInfo.Applications {
 		applications = append(applications, &common.Application{
-			Type:     string(app.Type),
-			FilePath: app.FilePath,
+			Type:     validateUTF8String(string(app.Type), "application.Type"),
+			FilePath: validateUTF8String(app.FilePath, "application.FilePath"),
 			Packages: ConvertToRPCPkgs(app.Packages),
 		})
 	}
@@ -891,46 +896,49 @@ func ConvertToRPCPutBlobRequest(diffID string, blobInfo ftypes.BlobInfo) *cache.
 	var misconfigurations []*common.Misconfiguration
 	for _, m := range blobInfo.Misconfigurations {
 		misconfigurations = append(misconfigurations, &common.Misconfiguration{
-			FileType:  string(m.FileType),
-			FilePath:  m.FilePath,
+			FileType:  validateUTF8String(string(m.FileType), "misconfiguration.FileType"),
+			FilePath:  validateUTF8String(m.FilePath, "misconfiguration.FilePath"),
 			Successes: ConvertToMisconfResults(m.Successes),
 			Warnings:  ConvertToMisconfResults(m.Warnings),
 			Failures:  ConvertToMisconfResults(m.Failures),
 		})
-
 	}
 
 	var customResources []*common.CustomResource
 	for _, res := range blobInfo.CustomResources {
 		data, err := structpb.NewValue(res.Data)
 		if err != nil {
-
+			log.Warn("Failed to convert custom resource data", log.Err(err))
 		} else {
 			customResources = append(customResources, &common.CustomResource{
-				Type:     res.Type,
-				FilePath: res.FilePath,
+				Type:     validateUTF8String(res.Type, "customResource.Type"),
+				FilePath: validateUTF8String(res.FilePath, "customResource.FilePath"),
 				Layer: &common.Layer{
-					Digest: res.Layer.Digest,
-					DiffId: res.Layer.DiffID,
+					Digest: validateUTF8String(res.Layer.Digest, "customResource.Layer.Digest"),
+					DiffId: validateUTF8String(res.Layer.DiffID, "customResource.Layer.DiffID"),
 				},
 				Data: data,
 			})
 		}
 	}
 
+	// Validate and sanitize string slices
+	sanitizedOpaqueDirs := validateUTF8StringSlice(blobInfo.OpaqueDirs, "OpaqueDirs")
+	sanitizedWhiteoutFiles := validateUTF8StringSlice(blobInfo.WhiteoutFiles, "WhiteoutFiles")
+
 	return &cache.PutBlobRequest{
-		DiffId: diffID,
+		DiffId: sanitizedDiffID,
 		BlobInfo: &cache.BlobInfo{
 			SchemaVersion:     ftypes.BlobJSONSchemaVersion,
-			Digest:            blobInfo.Digest,
-			DiffId:            blobInfo.DiffID,
+			Digest:            validateUTF8String(blobInfo.Digest, "blobInfo.Digest"),
+			DiffId:            validateUTF8String(blobInfo.DiffID, "blobInfo.DiffID"),
 			Os:                ConvertToRPCOS(blobInfo.OS),
 			Repository:        ConvertToRPCRepository(blobInfo.Repository),
 			PackageInfos:      packageInfos,
 			Applications:      applications,
 			Misconfigurations: misconfigurations,
-			OpaqueDirs:        blobInfo.OpaqueDirs,
-			WhiteoutFiles:     blobInfo.WhiteoutFiles,
+			OpaqueDirs:        sanitizedOpaqueDirs,
+			WhiteoutFiles:     sanitizedWhiteoutFiles,
 			CustomResources:   customResources,
 			Secrets:           ConvertToRPCSecrets(blobInfo.Secrets),
 			Licenses:          ConvertToRPCLicenseFiles(blobInfo.Licenses),
@@ -938,13 +946,32 @@ func ConvertToRPCPutBlobRequest(diffID string, blobInfo ftypes.BlobInfo) *cache.
 	}
 }
 
+// validateUTF8String checks if a string is valid UTF-8 and returns it if valid,
+// otherwise returns a placeholder and logs a warning
+func validateUTF8String(s string, fieldName string) string {
+	if !utf8.ValidString(s) {
+		log.Error("Invalid UTF-8 string in field "+fieldName, log.String("field", fieldName))
+		return "[invalid utf8 string]"
+	}
+	return s
+}
+
+// validateUTF8StringSlice validates each string in a slice
+func validateUTF8StringSlice(slice []string, fieldName string) []string {
+	var sanitized []string
+	for i, s := range slice {
+		sanitized = append(sanitized, validateUTF8String(s, fieldName+"["+strconv.Itoa(i)+"]"))
+	}
+	return sanitized
+}
+
 // ConvertToMisconfResults returns common.MisconfResult
 func ConvertToMisconfResults(results []ftypes.MisconfResult) []*common.MisconfResult {
 	var rpcResults []*common.MisconfResult
 	for _, r := range results {
 		rpcResults = append(rpcResults, &common.MisconfResult{
-			Namespace:      r.Namespace,
-			Message:        r.Message,
+			Namespace:      validateUTF8String(r.Namespace, "MisconfResult.Namespace"),
+			Message:        validateUTF8String(r.Message, "MisconfResult.Message"),
 			PolicyMetadata: ConvertToRPCPolicyMetadata(r.PolicyMetadata),
 			CauseMetadata:  ConvertToRPCCauseMetadata(r.CauseMetadata),
 		})
@@ -955,8 +982,8 @@ func ConvertToMisconfResults(results []ftypes.MisconfResult) []*common.MisconfRe
 // ConvertToMissingBlobsRequest returns MissingBlobsRequest object
 func ConvertToMissingBlobsRequest(imageID string, layerIDs []string) *cache.MissingBlobsRequest {
 	return &cache.MissingBlobsRequest{
-		ArtifactId: imageID,
-		BlobIds:    layerIDs,
+		ArtifactId: validateUTF8String(imageID, "MissingBlobsRequest.ArtifactId"),
+		BlobIds:    validateUTF8StringSlice(layerIDs, "MissingBlobsRequest.BlobIds"),
 	}
 }
 
